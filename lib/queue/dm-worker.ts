@@ -76,6 +76,31 @@ const FOLLOW_RECHECK_TOTAL_MS = FOLLOW_RECHECK_DELAYS_MS.reduce(
   0
 );
 
+/**
+ * Sends Meta answered with an error but may well have delivered anyway.
+ *
+ * Meta returns the generic code 1 OAuthException on /messages *after* the DM
+ * has reached the recipient — observed in production: a user tapped the reply's
+ * button 30 seconds after a send this worker had already marked FAILED. Logging
+ * that as a plain failure is harmful twice over: the job is retried (up to
+ * BACKOFF_DELAYS.length times, each retry another copy in the same inbox), and
+ * the comment never satisfies the reconciler's "handled" test, so every sweep
+ * re-enqueues it for the whole lookback window. Together that sent one person
+ * dozens of identical DMs.
+ *
+ * Flagging it as unconfirmed instead is exactly what dmDeliveryUnconfirmed is
+ * for: the sweep's dedup already treats that as handled, and processComment
+ * skips a DM whose delivery is unconfirmed. The trade-off is deliberate — a
+ * code 1 that really did fail means that person gets no DM and can comment
+ * again, which is far better than spamming someone who already received it.
+ */
+function isDeliveryUnconfirmed(error: unknown): boolean {
+  return (
+    error instanceof ZernioDeliveryUnconfirmedError ||
+    (error instanceof MetaApiError && error.code === 1)
+  );
+}
+
 function formatError(error: unknown): string {
   if (error instanceof MetaApiError) {
     return `${error.name} ${error.code}: ${error.message}`;
@@ -464,7 +489,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
                 commentId,
               },
             },
-            data: { publicReplyError: formatError(error), publicReplyDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError },
+            data: { publicReplyError: formatError(error), publicReplyDeliveryUnconfirmed: isDeliveryUnconfirmed(error) },
           })
           .catch(() => {});
       }
@@ -540,7 +565,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
         },
       });
       throw error;
@@ -761,7 +786,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
         },
       });
       throw error;
@@ -1186,12 +1211,12 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
         commentId: dedupeId,
         status: "FAILED",
         errorMessage: formatError(error),
-        dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+        dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
       },
       update: {
         status: "FAILED",
         errorMessage: formatError(error),
-        dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+        dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
       },
     });
     throw error;
@@ -1500,13 +1525,13 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
         },
         update: {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
         },
       });
       throw error;
@@ -1531,8 +1556,10 @@ async function processJob(job: Job<DmQueueJob>): Promise<void> {
   try {
     await dispatchJob(job);
   } catch (error) {
-    if (error instanceof ZernioDeliveryUnconfirmedError)
-      throw new UnrecoverableError(error.message);
+    // formatError() takes unknown; isDeliveryUnconfirmed() is a boolean check,
+    // so it does not narrow `error` the way the old instanceof test did.
+    if (isDeliveryUnconfirmed(error))
+      throw new UnrecoverableError(formatError(error));
     throw error;
   }
 }
