@@ -98,12 +98,6 @@ const FOLLOW_RECHECK_TOTAL_MS = FOLLOW_RECHECK_DELAYS_MS.reduce(
  * code 1 that really did fail means that person gets no DM and can comment
  * again, which is far better than spamming someone who already received it.
  */
-function isDeliveryUnconfirmed(error: unknown): boolean {
-  return (
-    error instanceof ZernioDeliveryUnconfirmedError ||
-    (error instanceof MetaApiError && error.code === 1)
-  );
-}
 
 function formatError(error: unknown): string {
   if (error instanceof MetaApiError) {
